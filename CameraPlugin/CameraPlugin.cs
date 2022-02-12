@@ -1,119 +1,114 @@
-﻿using Dalamud.Game.ClientState;
-using Dalamud.Game.Command;
-using Dalamud.Game.Internal;
+﻿using Dalamud.Game.Command;
 using Dalamud.Plugin;
 using ImGuiNET;
 using System;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using Dalamud.Game;
+using Dalamud.IoC;
+using Dalamud.Logging;
 
 namespace CameraPlugin
 {
-    public sealed partial class CameraPlugin : IDalamudPlugin
+    public class CameraPlugin : IDalamudPlugin
     {
         public string Name => "CameraMan";
         private const string CameraCommand = "/camera";
 
-        internal DalamudPluginInterface Interface;
-        internal CameraAddressResolver Address;
+        [PluginService]
+        public DalamudPluginInterface Interface { get; set; }
+        
+        [PluginService]
+        public CommandManager CommandManager { get; set; }
+        
+        [PluginService]
+        public SigScanner SigScanner { get; set; }
+        
+        private IntPtr CameraAddress { get; set; }
+        
         internal bool IsImguiSetupOpen = false;
-        internal CameraMemory InitialValues;
+        private readonly Config _config;
 
-        public void Initialize(DalamudPluginInterface pluginInterface)
+        public CameraPlugin()
         {
-            this.Interface = pluginInterface ?? throw new ArgumentNullException(nameof(pluginInterface), "DalamudPluginInterface cannot be null");
-            this.Interface.CommandManager.AddHandler(CameraCommand, new CommandInfo(CommandHandler));
-            this.Interface.UiBuilder.OnBuildUi += UiBuilder_OnBuildUi;
+            Interface.UiBuilder.Draw += OnDraw;
+            Interface.UiBuilder.OpenConfigUi += OnOpenConfigUi;
 
-            this.Address = new CameraAddressResolver();
-            this.Address.Setup(pluginInterface.TargetModuleScanner);
+            CommandManager.AddHandler(CameraCommand,
+                new CommandInfo(CommandHandler)
+                    {HelpMessage = "Opens camera configuration settings", ShowInHelp = true});
 
-            this.InitialValues = Marshal.PtrToStructure<CameraMemory>(Address.CameraAddress);
+            var cameraDistance = SigScanner.GetStaticAddressFromSig("74 05 E8 ?? ?? ?? ?? 48 8D 0D ?? ?? ?? ?? E8", 7);
+            CameraAddress = Marshal.ReadIntPtr(cameraDistance) + 0x114;
 
-            this.Interface.Framework.OnUpdateEvent += Framework_OnUpdateEvent;
+            _config = Interface.GetPluginConfig() as Config ?? new Config();
+            SetFromConfig(_config);
+        }
+
+        private void OnOpenConfigUi()
+        {
+            IsImguiSetupOpen = true;
         }
 
         public void Dispose()
         {
-            this.Interface.CommandManager.RemoveHandler(CameraCommand);
-            this.Interface.UiBuilder.OnBuildUi -= UiBuilder_OnBuildUi;
-            this.Interface.Framework.OnUpdateEvent -= Framework_OnUpdateEvent;
+            SaveToConfig();
+            SetFromConfig(new Config());
+            
+            CommandManager.RemoveHandler(CameraCommand);
+            Interface.UiBuilder.Draw -= OnDraw;
         }
 
-        internal void GameLogMessage(string message) => Interface.Framework.Gui.Chat.Print(message);
-
-        internal void GameLogError(string message) => Interface.Framework.Gui.Chat.PrintError(message);
-
-        private float OutOfCombatZoomMax = 20;
-        private bool WasInCombatPreviously = false;
-
-        public unsafe void Framework_OnUpdateEvent(Framework framework)
+        private unsafe void SaveToConfig()
         {
-            if (Interface.ClientState.Condition[ConditionFlag.InCombat])
+            var mem = (CameraMemory*)CameraAddress;
+            if (mem != null)
             {
-                if (!WasInCombatPreviously)
-                {
-                    WasInCombatPreviously = true;
-
-                    var mem = (CameraMemory*)Address.CameraAddress;
-                    if (mem != null)
-                    {
-                        OutOfCombatZoomMax = mem->zoomMax;
-                        if (mem->zoomCurrent > InitialValues.zoomMax)
-                            mem->zoomCurrent = InitialValues.zoomMax;
-                        if (mem->zoomMax > InitialValues.zoomMax)
-                            mem->zoomMax = InitialValues.zoomMax;
-                    }
-                }
+                _config.ZoomMax = mem->zoomMax;
+                _config.ZoomMin = mem->zoomMin;
+                _config.FovCurrent  = mem->fovCurrent;
+                _config.FovMax  = mem->fovMax;
             }
             else
             {
-                if (WasInCombatPreviously)
-                {
-                    WasInCombatPreviously = false;
-                    var mem = (CameraMemory*)Address.CameraAddress;
-                    if (mem != null)
-                    {
-                        mem->zoomMax = OutOfCombatZoomMax;
-                    }
-                }
+                PluginLog.Debug("---Error Saving---");
             }
+            
+            Interface.SavePluginConfig(_config);
         }
 
-        public void CommandHandler(string command, string args) => IsImguiSetupOpen = true;
+        private void CommandHandler(string command, string args) => IsImguiSetupOpen = true;
 
-        public unsafe void UiBuilder_OnBuildUi()
+        private unsafe void OnDraw()
         {
             if (!IsImguiSetupOpen)
                 return;
 
-            ImGui.SetNextWindowSize(new Vector2(400, 150), ImGuiCond.Always);
+            ImGui.SetNextWindowSize(new Vector2(375, 165), ImGuiCond.Always);
             ImGui.Begin("Zoom Setup", ref IsImguiSetupOpen, ImGuiWindowFlags.NoResize);
 
             ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(0, 5));
 
-            ImGui.Text($"Note: Settings are reset to their initial login values during combat.");
-
-            if (Interface.ClientState.Condition[ConditionFlag.InCombat])
+            var mem = (CameraMemory*)CameraAddress;
+            if (mem != null)
             {
-                ImGui.Text("---In Combat---");
+                ImGui.SliderFloat("Zoom Current", ref mem->zoomCurrent, 0, mem->zoomMax);
+                ImGui.SliderFloat("Zoom Min", ref mem->zoomMin, 0, 10);
+                if (ImGui.SliderFloat("Zoom Max", ref mem->zoomMax, 0, 500))
+                {
+                    if (mem->zoomMax < mem->zoomCurrent)
+                        mem->zoomCurrent = mem->zoomMax;
+                }
+                ImGui.SliderFloat("FoV Current", ref mem->fovCurrent, 0.6f, mem->fovMax);
+                if (ImGui.SliderFloat("FoV Max", ref mem->fovMax, .6f, 1.3f))
+                {
+                    if (mem->fovMax < mem->fovCurrent)
+                        mem->fovCurrent = mem->fovMax;
+                }
             }
             else
             {
-                var mem = (CameraMemory*)Address.CameraAddress;
-                if (mem != null)
-                {
-                    ImGui.SliderFloat("Zoom Current", ref mem->zoomCurrent, 0, mem->zoomMax);
-                    if (ImGui.SliderFloat("Zoom Max", ref mem->zoomMax, 0, 100))
-                    {
-                        if (mem->zoomMax < mem->zoomCurrent)
-                            mem->zoomCurrent = mem->zoomMax;
-                    }
-                }
-                else
-                {
-                    ImGui.Text($"---Error---");
-                }
+                ImGui.Text($"---Error---");
             }
 
             ImGui.PopStyleVar();
@@ -121,15 +116,22 @@ namespace CameraPlugin
             ImGui.End();
         }
 
-        private float ParseFloat(string arg)
+        private unsafe void SetFromConfig(Config config)
         {
-            try
+            var mem = (CameraMemory*)CameraAddress;
+            if (mem != null)
             {
-                return float.Parse(arg);
+                mem->zoomMax = config.ZoomMax;
+                mem->zoomMin = config.ZoomMin;
+                mem->fovCurrent = config.FovCurrent;
+                mem->fovMax = config.FovMax;
+                
+                if (mem->zoomMax < mem->zoomCurrent)
+                    mem->zoomCurrent = mem->zoomMax;
             }
-            catch (FormatException)
+            else
             {
-                return float.NaN;
+                PluginLog.Debug("---Error---");
             }
         }
 
@@ -137,7 +139,7 @@ namespace CameraPlugin
         internal struct CameraMemory
         {
             public float zoomCurrent;
-            public float zoomInterval;
+            public float zoomMin;
             public float zoomMax;
             public float fovCurrent;
             public float fovInterval;
@@ -145,21 +147,6 @@ namespace CameraPlugin
             public float unkCurrent;
             public float unkInterval;
             public float unkMax;
-        }
-
-        private void SetZoom(float value) => SetValue(value, "zoomCurrent");
-
-        private void SetZoomMax(float value) => SetValue(value, "zoomMax");
-
-        private void SetFov(float value) => SetValue(value, "fovCurrent");
-
-        private void SetFovMax(float value) => SetValue(value, "fovMax");
-
-        private void SetValue(float value, string cameraMemoryField)
-        {
-            var floatArray = new float[] { value };
-            var address = Address.CameraAddress + Marshal.OffsetOf(typeof(CameraMemory), cameraMemoryField).ToInt32();
-            Marshal.Copy(floatArray, 0, address, floatArray.Length);
         }
     }
 }
